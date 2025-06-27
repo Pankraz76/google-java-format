@@ -14,6 +14,12 @@
 
 package com.google.googlejavaformat.java;
 
+import static com.google.googlejavaformat.Newlines.guessLineSeparator;
+import static com.google.googlejavaformat.java.ImportOrderer.reorderImports;
+import static com.google.googlejavaformat.java.ModifierOrderer.reorderModifiers;
+import static com.google.googlejavaformat.java.RemoveUnusedDeclarations.removeUnusedDeclarations;
+import static com.google.googlejavaformat.java.RemoveUnusedImports.removeUnusedImports;
+import static com.google.googlejavaformat.java.StringWrapper.wrap;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
 import com.google.common.collect.ImmutableList;
@@ -117,17 +123,16 @@ public final class Formatter {
     Options.instance(context).put("allowStringFolding", "false");
     Options.instance(context).put("--enable-preview", "true");
     JCCompilationUnit unit;
-    JavacFileManager fileManager = new JavacFileManager(context, true, UTF_8);
-    try {
-      fileManager.setLocation(StandardLocation.PLATFORM_CLASS_PATH, ImmutableList.of());
+    try (JavacFileManager fileManager = new JavacFileManager(context, true, UTF_8)) {
+        fileManager.setLocation(StandardLocation.PLATFORM_CLASS_PATH, ImmutableList.of());
     } catch (IOException e) {
-      // impossible
-      throw new IOError(e);
+        throw new RuntimeException(e);
     }
+
     SimpleJavaFileObject source =
         new SimpleJavaFileObject(URI.create("source"), JavaFileObject.Kind.SOURCE) {
           @Override
-          public CharSequence getCharContent(boolean ignoreEncodingErrors) throws IOException {
+          public CharSequence getCharContent(boolean ignoreEncodingErrors) {
             return javaInput.getText();
           }
         };
@@ -154,7 +159,7 @@ public final class Formatter {
     if (Runtime.version().feature() >= 21) {
       visitor =
           createVisitor(
-              "com.google.googlejavaformat.java.java21.Java21InputAstVisitor", builder, options);
+                  builder, options);
     } else {
       visitor = new JavaInputAstVisitor(builder, options.indentationMultiplier());
     }
@@ -168,9 +173,9 @@ public final class Formatter {
   }
 
   private static JavaInputAstVisitor createVisitor(
-      final String className, final OpsBuilder builder, final JavaFormatterOptions options) {
+      final OpsBuilder builder, final JavaFormatterOptions options) {
     try {
-      return Class.forName(className)
+      return Class.forName("com.google.googlejavaformat.java.java21.Java21InputAstVisitor")
           .asSubclass(JavaInputAstVisitor.class)
           .getConstructor(OpsBuilder.class, int.class)
           .newInstance(builder, options.indentationMultiplier());
@@ -183,15 +188,9 @@ public final class Formatter {
     if (input.getKind() != Diagnostic.Kind.ERROR) {
       return false;
     }
-    switch (input.getCode()) {
-      case "compiler.err.invalid.meth.decl.ret.type.req":
-        // accept constructor-like method declarations that don't match the name of their
-        // enclosing class
-        return false;
-      default:
-        break;
-    }
-    return true;
+    // accept constructor-like method declarations that don't match the name of their
+    // enclosing class
+    return !input.getCode().equals("compiler.err.invalid.meth.decl.ret.type.req");
   }
 
   /**
@@ -232,11 +231,11 @@ public final class Formatter {
    *     Google Java Style Guide - 3.3.3 Import ordering and spacing</a>
    */
   public String formatSourceAndFixImports(String input) throws FormatterException {
-    input = ImportOrderer.reorderImports(input, options.style());
-    input = RemoveUnusedImports.removeUnusedImports(input);
-    String formatted = formatSource(input);
-    formatted = StringWrapper.wrap(formatted, this);
-    return formatted;
+    return wrap(
+            formatSource(
+                    removeUnusedDeclarations(
+                    removeUnusedImports(
+                    reorderImports(input, options.style())))), this);
   }
 
   /**
@@ -256,32 +255,30 @@ public final class Formatter {
   /**
    * Emit a list of {@link Replacement}s to convert from input to output.
    *
-   * @param input the input compilation unit
+   * @param input           the input compilation unit
    * @param characterRanges the character ranges to reformat
    * @return a list of {@link Replacement}s, sorted from low index to high index, without overlaps
    * @throws FormatterException if the input string cannot be parsed
    */
   public ImmutableList<Replacement> getFormatReplacements(
       String input, Collection<Range<Integer>> characterRanges) throws FormatterException {
-    JavaInput javaInput = new JavaInput(input);
-
     // TODO(cushon): this is only safe because the modifier ordering doesn't affect whitespace,
     // and doesn't change the replacements that are output. This is not true in general for
     // 'de-linting' changes (e.g. import ordering).
-    if (options.reorderModifiers()) {
-      javaInput = ModifierOrderer.reorderModifiers(javaInput, characterRanges);
-    }
+    var javaInput = options.reorderModifiers()
+            ? reorderModifiers(new JavaInput(input), characterRanges)
+            : new JavaInput(input);
+    var lineSeparator = guessLineSeparator(input);
+    return formatReplacements(javaInput, new JavaOutput(lineSeparator, javaInput, new JavaCommentsHelper(lineSeparator, options)), characterRanges);
+  }
 
-    String lineSeparator = Newlines.guessLineSeparator(input);
-    JavaOutput javaOutput =
-        new JavaOutput(lineSeparator, javaInput, new JavaCommentsHelper(lineSeparator, options));
+  private ImmutableList<Replacement> formatReplacements(JavaInput javaInput, JavaOutput javaOutput, Collection<Range<Integer>> characterRanges) throws FormatterException {
     try {
       format(javaInput, javaOutput, options);
     } catch (FormattingError e) {
       throw new FormatterException(e.diagnostics());
     }
-    RangeSet<Integer> tokenRangeSet = javaInput.characterRangesToTokenRanges(characterRanges);
-    return javaOutput.getFormatReplacements(tokenRangeSet);
+    return javaOutput.getFormatReplacements(javaInput.characterRangesToTokenRanges(characterRanges));
   }
 
   /**
@@ -294,14 +291,10 @@ public final class Formatter {
     lines.add(input.length() + 1);
 
     final RangeSet<Integer> characterRanges = TreeRangeSet.create();
-    for (Range<Integer> lineRange :
-        lineRanges.subRangeSet(Range.closedOpen(0, lines.size() - 1)).asRanges()) {
-      int lineStart = lines.get(lineRange.lowerEndpoint());
+    for (Range<Integer> lineRange : lineRanges.subRangeSet(Range.closedOpen(0, lines.size() - 1)).asRanges()) {
       // Exclude the trailing newline. This isn't strictly necessary, but handling blank lines
       // as empty ranges is convenient.
-      int lineEnd = lines.get(lineRange.upperEndpoint()) - 1;
-      Range<Integer> range = Range.closedOpen(lineStart, lineEnd);
-      characterRanges.add(range);
+      characterRanges.add(Range.closedOpen(lines.get(lineRange.lowerEndpoint()), lines.get(lineRange.upperEndpoint()) - 1));
     }
     return characterRanges;
   }
